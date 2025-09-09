@@ -1,0 +1,16 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+venv/
+env/
+
+# Data Files (IMPORTANT: See note below)
+/data/transactions.csv
+
+# IDE configuration files
+.vscode/
+.idea/
+
