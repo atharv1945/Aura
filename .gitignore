@@ -8,7 +8,7 @@ venv/
 env/
 
 # Data Files (IMPORTANT: See note below)
-/data/transactions.csv
+/data
 
 # IDE configuration files
 .vscode/
