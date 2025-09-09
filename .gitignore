@@ -6,6 +6,7 @@ __pycache__/
 *.env
 venv/
 env/
+.venv/
 
 # Data Files (IMPORTANT: See note below)
 /data
@@ -13,4 +14,5 @@ env/
 # IDE configuration files
 .vscode/
 .idea/
+
 

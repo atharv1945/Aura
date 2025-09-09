@@ -28,4 +28,3 @@ qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=vector_store.as_retrie
 query = "Explain the risk factors for borrower ID 12345"
 result = qa_chain.run(query)
 print(result)
-``
