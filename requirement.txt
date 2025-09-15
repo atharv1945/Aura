@@ -3,5 +3,6 @@ Faker
 numpy
 scikit-learn
 transformers
-torch
 datetime
+torch
+torch-geometric
