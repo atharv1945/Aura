@@ -27,6 +27,11 @@ EVENT_CHAINS = {
         {"type": "Loan Restructuring", "severity": "Medium", "delay": (10, 20), "impact_duration": 180},
         {"type": "Partial Recovery", "severity": "Low", "delay": (60, 90), "impact_duration": 180},
     ],
+    "late_stage_crisis": [
+        {"type": "Medical Emergency", "severity": "High", "delay": (5, 15), "impact_duration": 60},
+        {"type": "EMI Missed", "severity": "High", "delay": (20, 30), "impact_duration": 60},
+        {"type": "Payday Loan Taken", "severity": "Critical", "delay": None, "impact_duration": 90, "contagion_probability": 0.8},
+    ],
     "recovery_path_pro": [
         {"type": "Salary Hike", "severity": "Low", "delay": (30, 90), "impact_duration": 365},
         {"type": "Bonus Received", "severity": "Low", "delay": (15, 30), "impact_duration": 60},
@@ -79,4 +84,8 @@ STRESS_SCENARIOS = {
     "borrower_235": "recovery_path_pro", "borrower_238": "cascading_risk_pro",
     "borrower_240": "job_loss", "borrower_245": "fraud_anomaly",
     "borrower_248": "cascading_risk_pro", "borrower_250": "recovery_path_pro",
+    "borrower_018": "late_stage_crisis"
 }
+
+W_BASE = 0.4
+RISK_THRESHOLD = 0.6
