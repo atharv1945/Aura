@@ -1,25 +1,24 @@
+import pandas as pd
 import os
+import faiss
+from sentence_transformers import SentenceTransformer, CrossEncoder
+# --- Remove Langchain Imports if fully switching ---
+# from langchain_core.prompts import PromptTemplate
+# from langchain_core.output_parsers import StrOutputParser
+# from langchain_google_genai import ChatGoogleGenerativeAI
+# --- Add Native Google AI Import ---
+import google.generativeai as genai # <-- ADD THIS LINE
+# --- End ---
+from dotenv import load_dotenv
+import numpy as np
+from datetime import datetime, timedelta
 import sys
 import time
-import faiss
-import numpy as np
-import pandas as pd
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer, CrossEncoder
 
-# --- LangChain (v0.3+) imports ---
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-# --- CONFIGURATION ---
+# --- (Keep CONFIGURATION the same) ---
 # Assume scripts are run from the project root directory
-# Get the absolute path of the directory containing the current script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# Go one level up to get the project root
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-
 DATA_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
 PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
 COMMUNICATIONS_PATH = os.path.join(DATA_DIR, "communications.csv")
@@ -28,25 +27,23 @@ TRANSACTIONS_PATH = os.path.join(DATA_DIR, "transactions.csv")
 BORROWERS_ENHANCED_PATH = os.path.join(PROCESSED_DIR, "borrowers_enhanced.csv")
 AURA_SCORES_PATH = os.path.join(PROCESSED_DIR, "aura_risk_scores.csv")
 
-# Use config file for threshold if available, otherwise fallback
 RISK_THRESHOLD = 0.6 # Default threshold
 try:
-    # Temporarily add script directory to path to import config
     sys.path.insert(0, SCRIPT_DIR)
-    import data_config as config
-    RISK_THRESHOLD = config.RISK_THRESHOLD # Overwrite default if found
-    print(f"Loaded RISK_THRESHOLD={RISK_THRESHOLD} from data_config.py")
-except (ImportError, AttributeError, FileNotFoundError):
-    print(f"Warning: Could not import RISK_THRESHOLD from data_config. Using default {RISK_THRESHOLD}.")
+    # Check if data_config exists before importing
+    if os.path.exists(os.path.join(SCRIPT_DIR, "data_config.py")):
+        import data_config as config
+        RISK_THRESHOLD = config.RISK_THRESHOLD # Overwrite default if found
+        print(f"Loaded RISK_THRESHOLD={RISK_THRESHOLD} from data_config.py")
+    else:
+        print(f"Warning: data_config.py not found. Using default RISK_THRESHOLD={RISK_THRESHOLD}.")
+except Exception as e:
+    print(f"Warning: Could not import RISK_THRESHOLD from data_config: {e}. Using default {RISK_THRESHOLD}.")
 finally:
-    # Clean up sys.path modification
     if SCRIPT_DIR in sys.path:
-        try:
-            sys.path.remove(SCRIPT_DIR)
-        except ValueError:
-            pass # Path might have already been removed
+        try: sys.path.remove(SCRIPT_DIR)
+        except ValueError: pass
 
-# Load environment variables (for GOOGLE_API_KEY) from project root .env
 dotenv_path = os.path.join(PROJECT_ROOT, '.env')
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path=dotenv_path)
@@ -55,295 +52,158 @@ else:
     print(f"Warning: .env file not found at {dotenv_path}. GOOGLE_API_KEY should be set externally.")
 
 
+# --- (Keep augment_query, HybridRetriever, ReRanker classes the same) ---
 # --- PHASE 1: PRE-RETRIEVAL (Query Augmentation) ---
-
 def augment_query(borrower_id: str, events_df: pd.DataFrame, borrowers_df: pd.DataFrame) -> str:
-    """Augments a simple query with specific context about the borrower."""
     print(f"\n--- Phase 1: Augmenting Query for {borrower_id} ---")
-
-    # Safely get borrower profile
     borrower_profile = borrowers_df[borrowers_df['borrower_id'] == borrower_id]
     if borrower_profile.empty:
         print(f"Warning: Borrower profile not found for {borrower_id}.")
-        return f"Analyze the overall credit risk for {borrower_id}, considering any available transaction or communication data."
-
-    # Get archetype safely, provide default
+        return f"Analyze the overall credit risk for {borrower_id}."
     archetype = borrower_profile['behavioral_archetype'].iloc[0] if 'behavioral_archetype' in borrower_profile.columns else 'Unknown'
-
-    # Get events safely
     borrower_events = events_df[events_df['borrower_id'] == borrower_id].copy()
     if borrower_events.empty:
-        print("No events found for this borrower.")
-        return f"Analyze the overall credit risk for {borrower_id} based on their profile as a '{archetype}'."
-
-    # Ensure event_date is datetime and handle potential errors during conversion
+        print("No events found for this borrower."); return f"Analyze risk for {borrower_id} ({archetype})."
     borrower_events['event_date'] = pd.to_datetime(borrower_events['event_date'], errors='coerce')
-    borrower_events.dropna(subset=['event_date'], inplace=True) # Drop rows where date conversion failed
+    borrower_events.dropna(subset=['event_date'], inplace=True)
     if borrower_events.empty:
-         print("No valid events with dates found after cleaning.")
-         return f"Analyze the overall credit risk for {borrower_id} based on their profile as a '{archetype}'."
-
-    # Calculate severity score safely
+         print("No valid events with dates found."); return f"Analyze risk for {borrower_id} ({archetype})."
     borrower_events['severity_score'] = borrower_events['severity'].map({'Low': 1, 'Medium': 2, 'High': 3, 'Critical': 4}).fillna(0).astype(int)
-
-    # Get the 2 most recent severe events within the last 90 days for relevance
-    now = datetime.now() # Use consistent 'now' timestamp
+    now = datetime.now()
     recent_events = borrower_events[borrower_events['event_date'] > (now - timedelta(days=90))]
-
-    if recent_events.empty or recent_events['severity_score'].max() < 3: # Check if any High/Critical events exist recently
-        # Fallback: get any 2 most recent events if no severe ones in last 90 days
+    if recent_events.empty or recent_events['severity_score'].max() < 3:
         top_events = borrower_events.sort_values(by='event_date', ascending=False).head(2)
-        print("Warning: No High/Critical events in the last 90 days, using the 2 most recent events overall.")
+        print("Warning: No High/Critical events recently, using latest 2 events.")
     else:
-        # Sort recent events first by severity (desc), then by date (desc) to get most critical recent
         top_events = recent_events.sort_values(by=['severity_score', 'event_date'], ascending=[False, False]).head(2)
-
     event_str = "no specific critical events found recently"
     if not top_events.empty:
-        # Ensure event_type exists and handle potential NaNs safely
-        top_events['event_type_str'] = top_events['event_type'].astype(str).fillna('Unknown Event')
-        event_str = " and ".join(top_events['event_type_str'].unique().tolist()) # Use unique in case they are the same type
-
+        top_events['event_type_str'] = top_events['event_type'].astype(str).fillna('Unknown')
+        event_str = " and ".join(top_events['event_type_str'].unique().tolist())
     augmented_query = f"Analyze the credit risk for {borrower_id}, focusing on recent critical events like '{event_str}' and considering their behavioral profile as a '{archetype}'."
     print(f"Augmented Query: \"{augmented_query}\"")
     return augmented_query
 
 # --- PHASE 2: HYBRID RETRIEVAL ---
-
 class HybridRetriever:
-    """Retrieves evidence using both dense (semantic) and sparse (keyword) search."""
     def __init__(self, comms_df, events_df, transactions_df):
         print("\n--- Phase 2a: Initializing Hybrid Retriever ---")
-        self.events_df = events_df.copy()
-        self.transactions_df = transactions_df.copy()
-        self.comms_df = comms_df.copy()
-        self.index = None
-        self.model = None
-        self.faiss_to_df_index = None
-
-        print("Loading sentence transformer model for dense retrieval...")
-        try:
-            self.model = SentenceTransformer('all-MiniLM-L6-v2') # Standard effective model
-        except Exception as e:
-            print(f"Error loading SentenceTransformer model: {e}")
-            print("Dense retrieval will be skipped.")
-
+        self.events_df = events_df.copy(); self.transactions_df = transactions_df.copy(); self.comms_df = comms_df.copy()
+        self.index = None; self.model = None; self.faiss_to_df_index = None
+        print("Loading sentence transformer model..."); t_start = time.time()
+        try: self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        except Exception as e: print(f"Error loading SBERT: {e}. Dense retrieval skipped.")
+        print(f"Model loaded in {time.time()-t_start:.2f}s")
         if self.model and not self.comms_df.empty:
-            print("Building FAISS index for communications data...")
-            # Ensure comm_text is string, handle NaNs, and filter empty strings
+            print("Building FAISS index..."); t_start = time.time()
             self.comms_df['comm_text'] = self.comms_df['comm_text'].astype(str).fillna('')
             valid_comms = self.comms_df[self.comms_df['comm_text'].str.strip() != '']
-
             if not valid_comms.empty:
                 try:
-                    print(f"Encoding {len(valid_comms)} communication texts...")
-                    comms_embeddings = self.model.encode(valid_comms['comm_text'].tolist(), show_progress_bar=True, convert_to_tensor=True)
-                    embedding_dim = comms_embeddings.shape[1]
-                    print(f"Embeddings generated with dimension {embedding_dim}.")
-                    self.index = faiss.IndexFlatL2(embedding_dim) # Simple index for moderate size
+                    comms_embeddings = self.model.encode(valid_comms['comm_text'].tolist(), show_progress_bar=False, convert_to_tensor=True)
+                    embedding_dim = comms_embeddings.shape[1]; print(f"Encoded {len(valid_comms)} texts (dim: {embedding_dim}).")
+                    self.index = faiss.IndexFlatL2(embedding_dim)
                     self.index.add(comms_embeddings.cpu().detach().numpy())
-                    self.faiss_to_df_index = valid_comms.index # Store mapping
-                    print(f"FAISS index built with {self.index.ntotal} vectors.")
-                except Exception as e:
-                    print(f"Error building FAISS index: {e}")
-                    self.index = None # Disable dense search if index fails
-            else:
-                print("Warning: Communications data is empty or contains no text after cleaning. Dense retrieval skipped.")
-        elif self.comms_df.empty:
-             print("Warning: Communications dataframe is empty. Dense retrieval skipped.")
-        else:
-             print("Skipping FAISS index build because SentenceTransformer model failed to load.")
-
+                    self.faiss_to_df_index = valid_comms.index; print(f"FAISS index built ({self.index.ntotal} vectors).")
+                except Exception as e: print(f"Error building FAISS index: {e}"); self.index = None
+            else: print("Warning: No valid text in comms data. Dense retrieval skipped.")
+            print(f"Index built in {time.time()-t_start:.2f}s")
+        elif self.comms_df.empty: print("Warning: Comms df empty. Dense retrieval skipped.")
+        else: print("Skipping FAISS index build (model load failed).")
         print("Retriever initialized.")
 
     def _dense_retrieval(self, query: str, k: int = 5):
-        """Performs dense vector search."""
-        if self.index is None or self.index.ntotal == 0 or self.model is None:
-             print("Skipping dense retrieval (index/model unavailable or index empty).")
-             return []
+        if self.index is None or self.index.ntotal == 0 or self.model is None: return []
         try:
-            print(f"Performing dense search for query: '{query[:50]}...'")
-            query_embedding = self.model.encode([query])
-            actual_k = min(k, self.index.ntotal)
-            if actual_k <= 0: return [] # Cannot search index with 0 vectors
-
+            query_embedding = self.model.encode([query]); actual_k = min(k, self.index.ntotal)
+            if actual_k <= 0: return []
             distances, indices = self.index.search(query_embedding, actual_k)
-
-            # Check if indices are valid before attempting to map
-            valid_indices_mask = indices[0] != -1 # FAISS uses -1 for no result
-            valid_faiss_indices = indices[0][valid_indices_mask]
-
-            if len(valid_faiss_indices) == 0:
-                 print("Dense search returned no valid indices.")
-                 return []
-
-            # Map FAISS indices back to original DataFrame indices
-            # Ensure faiss_to_df_index is not None and indices are within bounds
-            if self.faiss_to_df_index is None or max(valid_faiss_indices) >= len(self.faiss_to_df_index):
-                 print("Error: FAISS index mapping is invalid.")
-                 return []
+            valid_indices_mask = indices[0] != -1; valid_faiss_indices = indices[0][valid_indices_mask]
+            if len(valid_faiss_indices) == 0: return []
+            if self.faiss_to_df_index is None or max(valid_faiss_indices) >= len(self.faiss_to_df_index): return []
             original_indices = self.faiss_to_df_index[valid_faiss_indices]
-
-            # Ensure indices exist in the original dataframe (safety check)
             valid_original_indices = original_indices[original_indices.isin(self.comms_df.index)]
-            if len(valid_original_indices) == 0:
-                 print("Dense search indices not found in original DataFrame.")
-                 return []
-
-            results = self.comms_df.loc[valid_original_indices].to_dict('records')
-            print(f"Dense search returned {len(results)} results.")
-            return results
-        except Exception as e:
-            print(f"Error during dense retrieval search: {e}")
-            return []
+            if len(valid_original_indices) == 0: return []
+            return self.comms_df.loc[valid_original_indices].to_dict('records')
+        except Exception as e: print(f"Error dense retrieval search: {e}"); return []
 
     def _sparse_retrieval(self, borrower_id: str):
-        """Performs targeted retrieval from structured event and transaction data."""
-        sparse_evidence = []
-        now = datetime.now() # Consistent timestamp
-
-        # Retrieve recent critical events
-        try:
+        sparse_evidence = []; now = datetime.now()
+        try: # Events
             borrower_events = self.events_df[self.events_df['borrower_id'] == borrower_id].copy()
             if not borrower_events.empty:
-                 borrower_events['event_date'] = pd.to_datetime(borrower_events['event_date'], errors='coerce')
-                 borrower_events.dropna(subset=['event_date'], inplace=True)
+                 borrower_events['event_date'] = pd.to_datetime(borrower_events['event_date'], errors='coerce'); borrower_events.dropna(subset=['event_date'], inplace=True)
                  if not borrower_events.empty:
                      borrower_events['severity_score'] = borrower_events['severity'].map({'Low': 1, 'Medium': 2, 'High': 3, 'Critical': 4}).fillna(0).astype(int)
-                     # Get top 3 most recent, highest severity events in last 180 days
                      recent_events = borrower_events[borrower_events['event_date'] > (now - timedelta(days=180))]
-                     # Sort by severity first, then date
                      top_events = recent_events.sort_values(by=['severity_score', 'event_date'], ascending=[False, False]).head(3)
                      sparse_evidence.extend(top_events.to_dict('records'))
-        except Exception as e:
-             print(f"Warning: Error retrieving events for sparse search: {e}")
-
-        # Retrieve recent large debit transactions
-        try:
+        except Exception as e: print(f"Warning: Error retrieving events: {e}")
+        try: # Transactions
             borrower_txs = self.transactions_df[self.transactions_df['borrower_id'] == borrower_id].copy()
             if not borrower_txs.empty:
-                 borrower_txs['date'] = pd.to_datetime(borrower_txs['date'], errors='coerce')
-                 borrower_txs.dropna(subset=['date'], inplace=True)
-                 # Get top 5 largest debit transactions in the last 90 days
+                 borrower_txs['date'] = pd.to_datetime(borrower_txs['date'], errors='coerce'); borrower_txs.dropna(subset=['date'], inplace=True)
                  recent_txs = borrower_txs[borrower_txs['date'] > (now - timedelta(days=90))]
                  top_transactions = recent_txs[recent_txs['type'] == 'debit'].nlargest(5, 'amount')
                  sparse_evidence.extend(top_transactions.to_dict('records'))
-        except Exception as e:
-             print(f"Warning: Error retrieving transactions for sparse search: {e}")
-
-        print(f"Sparse search found {len(sparse_evidence)} items (events + transactions).")
+        except Exception as e: print(f"Warning: Error retrieving transactions: {e}")
         return sparse_evidence
 
-
     def retrieve(self, query: str, borrower_id: str, k_dense: int = 7):
-        """Combines dense and sparse results."""
-        print("\n--- Phase 2b: Retrieving Evidence ---")
+        print("\n--- Phase 2b: Retrieving Evidence ---"); t_start = time.time()
         dense_results = self._dense_retrieval(query, k=k_dense)
         sparse_results = self._sparse_retrieval(borrower_id)
-
-        evidence_set = set() # Use set for automatic deduplication
-
-        # Process Dense Results (Communications)
-        for item in dense_results:
-            # Safely get and format data
-            comm_date_obj = pd.to_datetime(item.get('comm_date', pd.NaT), errors='coerce')
-            comm_date = comm_date_obj.strftime('%Y-%m-%d') if pd.notna(comm_date_obj) else 'Unknown Date'
-            channel = str(item.get('comm_channel', 'N/A')).strip()
-            text = str(item.get('comm_text', '')).strip()
-            if text:
-                evidence_set.add(f"Communication ({comm_date}, {channel}): {text}")
-
-        # Process Sparse Results (Events and Transactions)
-        for item in sparse_results:
-            if 'event_type' in item: # Check if it looks like an event
-                event_type = str(item.get('event_type', 'N/A')).strip()
-                severity = str(item.get('severity', 'N/A')).strip()
-                event_date_obj = pd.to_datetime(item.get('event_date', pd.NaT), errors='coerce') # Coerce errors here too
-                date_str = event_date_obj.strftime('%Y-%m-%d') if pd.notna(event_date_obj) else 'Unknown Date'
+        evidence_set = set()
+        for item in dense_results: # Comms
+            comm_date_obj=pd.to_datetime(item.get('comm_date',pd.NaT),errors='coerce'); comm_date=comm_date_obj.strftime('%Y-%m-%d') if pd.notna(comm_date_obj) else 'Unknown'
+            channel=str(item.get('comm_channel','N/A')).strip(); text=str(item.get('comm_text','')).strip()
+            if text: evidence_set.add(f"Comm ({comm_date}, {channel}): {text}")
+        for item in sparse_results: # Events & Txs
+            if 'event_type' in item:
+                event_type=str(item.get('event_type','N/A')).strip(); severity=str(item.get('severity','N/A')).strip()
+                event_date_obj=pd.to_datetime(item.get('event_date',pd.NaT),errors='coerce'); date_str=event_date_obj.strftime('%Y-%m-%d') if pd.notna(event_date_obj) else 'Unknown'
                 evidence_set.add(f"Event ({date_str}): Type='{event_type}', Severity='{severity}'.")
-            elif 'amount' in item and 'date' in item: # Check if it looks like a transaction
-                amount = item.get('amount', 0)
-                # Ensure amount is numeric before formatting
-                try:
-                    amount_float = float(amount)
-                except (ValueError, TypeError):
-                    amount_float = 0 # Default if conversion fails
-
-                desc = str(item.get('description', 'N/A')).strip()
-                tx_date_obj = pd.to_datetime(item.get('date', pd.NaT), errors='coerce')
-                date_str = tx_date_obj.strftime('%Y-%m-%d %H:%M') if pd.notna(tx_date_obj) else 'Unknown Date'
-                # Only add meaningful transactions
-                if amount_float > 0:
-                     evidence_set.add(f"Transaction ({date_str}): Debit of {amount_float:.2f} for '{desc}'.")
-
-        evidence = sorted(list(evidence_set)) # Sort for consistency
-        print(f"Retrieved {len(evidence)} unique initial pieces of evidence.")
+            elif 'amount' in item and 'date' in item:
+                try: amount_float=float(item.get('amount',0))
+                except: amount_float=0
+                desc=str(item.get('description','N/A')).strip(); tx_date_obj=pd.to_datetime(item.get('date',pd.NaT),errors='coerce')
+                date_str=tx_date_obj.strftime('%Y-%m-%d %H:%M') if pd.notna(tx_date_obj) else 'Unknown'
+                if amount_float > 0: evidence_set.add(f"Tx ({date_str}): Debit {amount_float:.2f} for '{desc}'.")
+        evidence = sorted(list(evidence_set)); print(f"Retrieved {len(evidence)} unique evidence pieces in {time.time()-t_start:.2f}s.")
         return evidence
 
-
 # --- PHASE 3A: POST-RETRIEVAL RE-RANKING ---
-
 class ReRanker:
-    """Uses a Cross-Encoder to re-rank retrieved evidence for relevance."""
     def __init__(self):
-        print("\n--- Phase 3a: Initializing Re-ranker ---")
-        self.model = None
+        print("\n--- Phase 3a: Initializing Re-ranker ---"); self.model = None; t_start = time.time()
         try:
-            # Using a well-regarded cross-encoder for relevance ranking
-            self.model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
-            print("Re-ranker initialized.")
-        except Exception as e:
-            print(f"Error initializing CrossEncoder model: {e}. Download might be needed or model name incorrect.")
-            print("Re-ranking will be skipped.")
+            self.model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512); print(f"Re-ranker initialized in {time.time()-t_start:.2f}s.")
+        except Exception as e: print(f"Error initializing CrossEncoder: {e}. Re-ranking skipped.")
 
     def rerank(self, query: str, documents: list[str], top_k: int = 5) -> list[str]:
-        """Re-ranks documents based on query relevance."""
-        if not self.model or not documents:
-             print("Skipping re-ranking (model unavailable or no documents).")
-             # Return top k based on original retrieval order as a fallback
-             return documents[:top_k]
-
-        print(f"Re-ranking {len(documents)} pieces of evidence for query: '{query[:50]}...'")
-        # Prepare pairs for the cross-encoder: [query, document]
+        if not self.model or not documents: print("Skipping re-ranking."); return documents[:top_k]
+        print(f"Re-ranking {len(documents)} evidence pieces..."); t_start = time.time()
         pairs = [[query, doc] for doc in documents]
         try:
-            # Predict relevance scores
-            scores = self.model.predict(pairs, show_progress_bar=True)
-
-            # Combine documents with scores and sort descending by score
+            scores = self.model.predict(pairs, show_progress_bar=False)
             doc_scores = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
-
-            # Select the top_k most relevant documents
-            ranked_docs = [doc for doc, score in doc_scores[:top_k]]
-            print(f"Re-ranked and selected top {len(ranked_docs)} pieces of evidence.")
-            # # Optional: Print scores for debugging
-            # print("Top evidence scores:")
-            # for doc, score in doc_scores[:top_k]:
-            #      print(f"  Score: {score:.4f} | Doc: {doc[:100]}...")
+            ranked_docs = [doc for doc, score in doc_scores[:top_k]]; print(f"Selected top {len(ranked_docs)} evidence pieces in {time.time()-t_start:.2f}s.")
             return ranked_docs
-        except Exception as e:
-            print(f"Error during re-ranking prediction: {e}")
-            print("Returning original top K documents as fallback.")
-            return documents[:top_k]
+        except Exception as e: print(f"Error during re-ranking: {e}. Returning original top K."); return documents[:top_k]
 
-# --- PHASE 3B: NARRATIVE GENERATION ---
+# --- PHASE 3B: NARRATIVE GENERATION (Native Google AI) ---
 
 def generate_narrative(query: str, evidence: list[str]):
-    """Generates the final human-readable narrative using an LLM."""
-    print("\n--- Phase 3b: Generating Final Narrative ---")
+    """Generates the final human-readable narrative using the native google-generativeai library."""
+    print("\n--- Phase 3b: Generating Final Narrative (Native Google AI) ---")
 
     if not evidence:
-        print("No evidence provided to LLM.")
-        return "No specific evidence was retrieved to generate a detailed narrative. Please review the borrower's overall profile manually."
-
-    # Ensure evidence list contains only non-empty strings
+        print("No evidence provided to LLM."); return "No specific evidence retrieved..."
     formatted_evidence = "\n".join([f"- {str(item)}" for item in evidence if isinstance(item, str) and str(item).strip()])
     if not formatted_evidence:
-         print("Formatted evidence is empty after cleaning. Cannot generate narrative.")
-         return "Retrieved evidence was empty or invalid. Cannot generate narrative."
+         print("Formatted evidence empty after cleaning."); return "Retrieved evidence empty/invalid."
 
-    # More specific instructions for the LLM
-    prompt_template = """
+    full_prompt = f"""
     **Role:** You are an expert Credit Risk Analyst reviewing a borrower's file.
     **Task:** Based *only* on the evidence provided below, write a concise risk assessment narrative (one paragraph) suitable for a credit review meeting.
     **Instructions:**
@@ -355,202 +215,212 @@ def generate_narrative(query: str, evidence: list[str]):
     **ANALYST QUERY:** {query}
 
     **AVAILABLE EVIDENCE (Ranked by relevance):**
-    {evidence}
+    {formatted_evidence}
 
     **RISK NARRATIVE (One Paragraph):**
     """
 
-    prompt = PromptTemplate(template=prompt_template, input_variables=["query", "evidence"])
-
     try:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            raise ValueError("GOOGLE_API_KEY not found in environment variables. Cannot call LLM.")
+            raise ValueError("GOOGLE_API_KEY not found in environment variables.")
 
-        # Use a recommended, reliable Gemini model
-        llm = ChatGoogleGenerativeAI(model="models/gemini-flash-latest", # Use the full model path compatible with older v1beta API endpoints.
-                                     temperature=0.2, # Lower temperature for factual summary
-                                     google_api_key=api_key,
-                                     convert_system_message_to_human=True) # Helps some models understand prompts better
+        # Configure the native client
+        genai.configure(api_key=api_key)
 
-        # Modern LCEL (LangChain Expression Language) approach
-        output_parser = StrOutputParser()
-        chain = prompt | llm | output_parser
-
-        print(f"Sending request to Gemini model ({llm.model})...")
+        # Select the model
+        model_name = "gemini-2.5-pro" # Using the latest flash as it worked before
+        model = genai.GenerativeModel(model_name)
+        print(f"Sending request to Gemini model ({model_name}) via native library...")
         start_time = time.time()
-        # Use .invoke() for modern LCEL chains
-        narrative = chain.invoke({"query": query, "evidence": formatted_evidence})
+
+        # Make the API call
+        response = model.generate_content(
+            full_prompt,
+            generation_config=genai.types.GenerationConfig(temperature=0.2), # Control creativity
+            # Add safety settings to be less restrictive if needed (adjust cautiously)
+            # safety_settings={
+            #     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            #     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            #     HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            #     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            # }
+        )
         end_time = time.time()
         print(f"LLM generation took {end_time - start_time:.2f} seconds.")
 
-        # Basic cleanup - remove potential markdown/headers
-        narrative = narrative.strip().replace("**RISK NARRATIVE:**", "").replace("RISK NARRATIVE:", "").strip()
+        # --- FIX: Robust text extraction for native library ---
+        narrative = ""
+        try:
+            # Check for blocking first
+            if not response.candidates:
+                 prompt_feedback = getattr(response, 'prompt_feedback', None)
+                 block_reason = getattr(prompt_feedback, 'block_reason', 'Unknown') if prompt_feedback else 'Unknown'
+                 safety_ratings = getattr(prompt_feedback, 'safety_ratings', []) if prompt_feedback else []
+                 print(f"Warning: Prompt blocked by API. Reason: {block_reason}. Safety Ratings: {safety_ratings}")
+                 return f"LLM prompt blocked due to safety filters (Reason: {block_reason}). Review evidence/prompt."
 
-    # Catch specific API errors if possible, otherwise general exception
+            # Check candidate finish reason
+            candidate = response.candidates[0]
+            finish_reason_enum = getattr(genai.types.Candidate, 'FinishReason', None) # Get Enum safely
+            expected_stop = finish_reason_enum.STOP if finish_reason_enum else 1 # Default expected value if Enum not found
+
+            if candidate.finish_reason != expected_stop:
+                finish_reason_name = finish_reason_enum(candidate.finish_reason).name if finish_reason_enum else str(candidate.finish_reason)
+                print(f"Warning: Generation finished reason: {finish_reason_name}")
+                safety_ratings = getattr(candidate, 'safety_ratings', [])
+                safety_detail = f" Safety Ratings: {safety_ratings}" if safety_ratings else ""
+                # Return specific message based on reason if possible
+                if finish_reason_name == "SAFETY":
+                     return f"LLM generation stopped due to SAFETY filters.{safety_detail}"
+                elif finish_reason_name == "MAX_TOKENS":
+                     return f"LLM generation stopped due to reaching maximum output tokens."
+                else:
+                     return f"LLM generation stopped prematurely ({finish_reason_name}).{safety_detail}"
+
+            # Extract text from parts
+            if candidate.content.parts:
+                narrative = candidate.content.parts[0].text
+            else:
+                narrative = "" # No parts returned
+
+        except AttributeError as ae:
+            # Handle potential changes in the response object structure
+            print(f"Warning: Error parsing LLM response object (AttributeError: {ae}). Trying direct .text access.")
+            try:
+                narrative = response.text # Simpler access sometimes works
+            except AttributeError:
+                print("Error: Could not extract text from LLM response using standard methods.")
+                narrative = "" # Give up if .text also fails
+        except Exception as parse_e:
+             print(f"Error parsing LLM response object: {parse_e}")
+             narrative = ""
+        # --- END FIX ---
+
+
+        narrative = narrative.strip() # Basic cleanup
+
+        if not narrative or narrative.lower() == 'none':
+             print("Warning: LLM generation returned an empty or 'None' response.")
+             return "LLM generation resulted in an empty narrative. Evidence might be insufficient or unclear."
+
+        return narrative
+
     except Exception as e:
+        # Keep similar error handling as before
         print(f"ERROR during LLM generation: {type(e).__name__} - {e}")
-        # Provide a more user-friendly error message
-        error_msg = f"Failed to generate narrative due to an error: {str(e)[:150]}..."
-        if "API key" in str(e):
-            error_msg += " Please check if the GOOGLE_API_KEY is correct and active."
-        elif "quota" in str(e).lower():
-            error_msg += " API quota might have been exceeded."
-        elif "content has been blocked" in str(e).lower():
-             # Check if response object exists and has safety ratings
-             # This part might need adjustment depending on the exact exception structure from langchain/google-generativeai
-             # safety_info = getattr(e, 'response', {}).get('prompt_feedback', {}).get('safety_ratings', [])
-             # if safety_info:
-             #      error_msg += f" Generation failed due to content safety filters: {safety_info}"
-             # else:
-                  error_msg += " Generation failed due to content safety filters. The evidence might contain sensitive terms."
-
-        elif "Deadline Exceeded" in str(e) or "504" in str(e):
-             error_msg += " The request to the LLM timed out. You might try again later."
-        elif "Model not found" in str(e):
-             error_msg += " The specified LLM model name might be incorrect or unavailable."
-
+        error_msg = f"Failed to generate narrative: {str(e)[:150]}..."
+        if "API key" in str(e): error_msg += " Check GOOGLE_API_KEY."
+        elif "quota" in str(e).lower(): error_msg += " API quota exceeded?"
+        elif "permission_denied" in str(e).lower() or "403" in str(e): error_msg += " Permission denied. Check API key/project."
+        elif "Model not found" in str(e) or "is not found" in str(e): error_msg += f" Model '{model_name}' not found or unavailable."
+        # Add specific error for Resource Exhausted (e.g., rate limiting)
+        elif "Resource has been exhausted" in str(e) or "429" in str(e):
+            error_msg += " API rate limit likely exceeded. Please wait and try again."
         return error_msg
 
 
+# --- (Keep run_explainability_pipeline and __main__ block the same) ---
 # --- MAIN EXECUTION ORCHESTRATOR ---
 def run_explainability_pipeline(borrower_id: str):
     """Runs the full, upgraded RAG pipeline for a given borrower."""
     print(f"\n{'='*50}")
     print(f"STARTING AURA EXPLAINABILITY PIPELINE FOR: {borrower_id}")
-    print(f"{'='*50}")
-
+    print(f"{'='*50}"); t_pipeline_start = time.time()
     try:
-        # Load data with improved error handling and date parsing
-        print(f"Loading data from raw dir: {DATA_DIR} and processed dir: {PROCESSED_DIR}...")
-
-        # Define expected date columns and formats for robust parsing
-        date_parsers = {
-            COMMUNICATIONS_PATH: {'comm_date': '%Y-%m-%d'},
-            EVENTS_PATH: {'event_date': '%Y-%m-%d'},
-            TRANSACTIONS_PATH: {'date': '%Y-%m-%d %H:%M:%S'}
-        }
-
-        # Function to load and parse dates safely
+        print(f"Loading data from raw: {DATA_DIR}, processed: {PROCESSED_DIR}...")
+        date_parsers={'comms': {'comm_date': '%Y-%m-%d'},'events': {'event_date': '%Y-%m-%d'},'tx': {'date': '%Y-%m-%d %H:%M:%S'}}
         def load_and_parse(path, parse_dict):
-            df = pd.read_csv(path)
-            for col, fmt in parse_dict.items():
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], format=fmt, errors='coerce')
-                else:
-                    print(f"Warning: Expected date column '{col}' not found in {os.path.basename(path)}.")
-            return df
+             if not os.path.exists(path): raise FileNotFoundError(f"Required: {path}")
+             df = pd.read_csv(path); df_name = os.path.basename(path)
+             for col, fmt in parse_dict.items():
+                 if col in df.columns:
+                     original_col = df[col].copy(); df[col] = pd.to_datetime(df[col], format=fmt, errors='coerce')
+                     failed_mask = df[col].isna() & pd.notna(original_col)
+                     if failed_mask.any():
+                          # print(f"Info: Format '{fmt}' failed for {failed_mask.sum()} rows in '{col}' ({df_name}), inferring...") # Less verbose
+                          with pd.option_context('mode.chained_assignment', None): # Suppress warning if possible
+                              df.loc[failed_mask, col] = pd.to_datetime(original_col[failed_mask], errors='coerce', infer_datetime_format=True)
+                 # else: print(f"Info: Date col '{col}' not found in {df_name}.") # Less verbose
+             return df
 
-        comms_df = load_and_parse(COMMUNICATIONS_PATH, date_parsers[COMMUNICATIONS_PATH])
-        events_df = load_and_parse(EVENTS_PATH, date_parsers[EVENTS_PATH])
-        transactions_df = load_and_parse(TRANSACTIONS_PATH, date_parsers[TRANSACTIONS_PATH])
+        comms_df = load_and_parse(COMMUNICATIONS_PATH, date_parsers['comms'])
+        events_df = load_and_parse(EVENTS_PATH, date_parsers['events'])
+        transactions_df = load_and_parse(TRANSACTIONS_PATH, date_parsers['tx'])
         borrowers_df = pd.read_csv(BORROWERS_ENHANCED_PATH)
 
-        # --- Data Validation and Type Conversion ---
         required_files = {'comms': comms_df, 'events': events_df, 'tx': transactions_df, 'borrowers': borrowers_df}
         for name, df in required_files.items():
-            if df.empty:
-                print(f"Warning: {name}.csv loaded as empty DataFrame.")
-            if 'borrower_id' not in df.columns:
-                 print(f"Fatal Error: 'borrower_id' column missing in {name}.csv. Cannot proceed.")
-                 return
-            # Convert borrower_id to string AFTER loading
+            if df.empty: print(f"Warning: {name}.csv loaded empty.")
+            if 'borrower_id' not in df.columns: raise ValueError(f"'borrower_id' missing in {name}.csv.")
             df['borrower_id'] = df['borrower_id'].astype(str)
 
-        # Drop rows with invalid dates after attempting parse
-        comms_df.dropna(subset=['comm_date'], inplace=True)
-        events_df.dropna(subset=['event_date'], inplace=True)
-        transactions_df.dropna(subset=['date'], inplace=True)
-        print("Data loaded and basic validation complete.")
+        date_cols_to_check = {'comms': 'comm_date', 'events': 'event_date', 'tx': 'date'}
+        for name, col in date_cols_to_check.items():
+             df = required_files[name]
+             if col in df.columns:
+                  initial_len = len(df); df.dropna(subset=[col], inplace=True)
+                  # if len(df) < initial_len: print(f"Info: Dropped {initial_len - len(df)} rows from {name}.csv due to invalid date in '{col}'.") # Less verbose
 
-    except FileNotFoundError as e:
-        print(f"Fatal Error: Data file not found - {e}. Ensure all raw and processed files exist. Cannot proceed.")
-        return
-    except Exception as e:
-        print(f"Fatal Error loading or parsing data: {e}. Check CSV formats and paths. Cannot proceed.")
-        return
+        print("Data loading and validation complete.")
 
-    # --- Run Pipeline Phases ---
-    # Phase 1: Augment Query
+    except (FileNotFoundError, ValueError) as e: print(f"Fatal Error: {e}. Cannot proceed."); return
+    except Exception as e: print(f"Fatal Error loading/parsing data: {e}. Cannot proceed."); return
+
     augmented_query = augment_query(borrower_id, events_df, borrowers_df)
-
-    # Phase 2: Retrieve Evidence
     retriever = HybridRetriever(comms_df, events_df, transactions_df)
-    initial_evidence = retriever.retrieve(augmented_query, borrower_id, k_dense=10) # Retrieve more initially
-
-    # Phase 3a: Re-rank Evidence
+    initial_evidence = retriever.retrieve(augmented_query, borrower_id, k_dense=10)
     reranker = ReRanker()
-    ranked_evidence = reranker.rerank(augmented_query, initial_evidence, top_k=5) # Select top 5-7 for LLM
-
-    # Phase 3b: Generate Narrative
+    ranked_evidence = reranker.rerank(augmented_query, initial_evidence, top_k=7)
     final_narrative = generate_narrative(augmented_query, ranked_evidence)
 
-    # --- Display Final Output ---
     print(f"\n{'='*50}")
-    print(f"PIPELINE COMPLETE FOR {borrower_id}. FINAL NARRATIVE:")
+    print(f"PIPELINE COMPLETE FOR {borrower_id} in {time.time()-t_pipeline_start:.2f}s. FINAL NARRATIVE:")
     print(f"{'='*50}")
-    print(final_narrative)
+    print(final_narrative if final_narrative else "[No narrative generated or error occurred]")
 
-# --- Main execution logic ---
 if __name__ == "__main__":
     print("Running explainability_engine.py...")
-
-    # Check for API Key first
     api_key_present = os.getenv("GOOGLE_API_KEY")
     if not api_key_present:
-        print("\n[FATAL ERROR] GOOGLE_API_KEY is not set.")
-        print(f"Please ensure you have a .env file in the project root ({PROJECT_ROOT})")
-        print("with the line: GOOGLE_API_KEY=\"YOUR_API_KEY_HERE\"")
-        print("You can test your key using 'python scripts/test_api_key.py'")
-        sys.exit(1) # Exit if key is missing
+        print(f"\n[FATAL ERROR] GOOGLE_API_KEY not set. Check .env file in {PROJECT_ROOT}")
+        sys.exit(1)
 
     flagged_borrowers = []
     try:
-        # --- DYNAMICALLY FIND FLAGGED BORROWERS ---
         if os.path.exists(AURA_SCORES_PATH):
             scores_df = pd.read_csv(AURA_SCORES_PATH)
             if not scores_df.empty:
-                scores_df['borrower_id'] = scores_df['borrower_id'].astype(str) # Ensure consistent type
-                # Handle potential NaN scores before comparison
+                scores_df['borrower_id'] = scores_df['borrower_id'].astype(str)
                 scores_df['aura_risk_score'] = pd.to_numeric(scores_df['aura_risk_score'], errors='coerce')
-                # Filter out NaNs before applying threshold
                 scores_df.dropna(subset=['aura_risk_score'], inplace=True)
                 flagged_borrowers_df = scores_df[scores_df['aura_risk_score'] > RISK_THRESHOLD]
                 flagged_borrowers = flagged_borrowers_df['borrower_id'].tolist()
-                print(f"\nFound {len(flagged_borrowers)} borrowers flagged by predictive engine (Score > {RISK_THRESHOLD}).")
-            else:
-                print(f"Warning: {AURA_SCORES_PATH} is empty.")
-        else:
-             print(f"Warning: Could not find {AURA_SCORES_PATH}. Cannot automatically determine flagged borrowers.")
+                print(f"\nFound {len(flagged_borrowers)} borrowers flagged (Score > {RISK_THRESHOLD}).")
+            else: print(f"Warning: {AURA_SCORES_PATH} is empty.")
+        else: print(f"Warning: Could not find {AURA_SCORES_PATH}. Cannot find flagged borrowers.")
+    except Exception as e: print(f"Error reading {AURA_SCORES_PATH}: {e}")
 
-    except pd.errors.EmptyDataError:
-        print(f"Warning: {AURA_SCORES_PATH} is empty.")
-    except Exception as e:
-        print(f"Error reading or processing {AURA_SCORES_PATH}: {e}")
-
-    # --- Run pipeline for flagged borrowers, or default if none ---
     if flagged_borrowers:
         print(f"Running Explainability Engine for flagged borrowers: {flagged_borrowers}")
-        for borrower_id in flagged_borrowers:
-            run_explainability_pipeline(borrower_id)
+        limit_flagged = 3
+        for borrower_id in flagged_borrowers[:limit_flagged]: run_explainability_pipeline(borrower_id)
+        if len(flagged_borrowers) > limit_flagged: print(f"... and {len(flagged_borrowers) - limit_flagged} more.")
     else:
-        # Define a default borrower known to have a complex history (our engineered case)
         default_borrower = "borrower_018"
-        print(f"\nNo borrowers were flagged by the predictive engine in this run (or scores file missing/empty).")
-        print(f"Running explainability pipeline for a default high-risk example ({default_borrower}) for demonstration.")
-        # Ensure the default borrower exists in the borrowers file for a meaningful run
+        print(f"\nNo borrowers flagged. Running for default example ({default_borrower}).")
         try:
-             # Check if borrowers_enhanced exists before trying to read
              if os.path.exists(BORROWERS_ENHANCED_PATH):
                  borrowers_check_df = pd.read_csv(BORROWERS_ENHANCED_PATH)
                  borrowers_check_df['borrower_id'] = borrowers_check_df['borrower_id'].astype(str)
-                 if default_borrower in borrowers_check_df['borrower_id'].tolist():
-                      run_explainability_pipeline(default_borrower)
+                 if default_borrower in borrowers_check_df['borrower_id'].tolist(): run_explainability_pipeline(default_borrower)
                  else:
-                      print(f"Warning: Default borrower {default_borrower} not found in {BORROWERS_ENHANCED_PATH}. Cannot run default example.")
-             else:
-                  print(f"Warning: Cannot check for default borrower, {BORROWERS_ENHANCED_PATH} not found.")
-        except Exception as e:
-             print(f"Error trying to run default example: {e}")
+                      fallback_borrower = "borrower_028"
+                      if fallback_borrower in borrowers_check_df['borrower_id'].tolist():
+                           print(f"Warning: {default_borrower} not found. Using fallback {fallback_borrower}."); run_explainability_pipeline(fallback_borrower)
+                      else: print(f"Warning: Defaults ({default_borrower}, {fallback_borrower}) not found. Cannot run default.")
+             else: print(f"Warning: Cannot check default borrower, {BORROWERS_ENHANCED_PATH} not found.")
+        except Exception as e: print(f"Error trying default example: {e}")
 
     print("\nExplainability engine script finished.")
+
